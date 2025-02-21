@@ -47,6 +47,9 @@ def elemwise(func, *args, **kwargs):
     it is necessary to convert Numpy arrays to [`sparse.COO`][] objects.
     """
 
+    if getattr(func, "nin", None) == 1 and getattr(func, "nout", None) == 1:
+        return _Unary(func, *args, **kwargs).get_result()
+
     return _Elemwise(func, *args, **kwargs).get_result()
 
 
@@ -749,6 +752,114 @@ class _Elemwise:
             ]
 
         return matched_arrays
+
+
+
+class _Unary:
+    def __init__(self, func, sparse_arg, **kwargs):
+        """
+        Initialize the element-wise function calculator for unary functions.
+
+        Parameters
+        ----------
+        func : types.Callable
+            The function to compute
+        sparse_arg : SparseArray
+            The argument to compute the function on. Must be a SparseArray
+        **kwargs : dict
+            Extra arguments to pass to the function.
+        """
+        from ._coo import COO
+        from ._dok import DOK
+
+        out_type = type(sparse_arg)
+
+        if isinstance(sparse_arg, DOK):
+            sparse_arg = sparse_arg.asformat(COO)
+
+        if sparse_arg.ndim == 0:
+            sparse_arg = sparse_arg.todense()
+
+        self.out_type = out_type
+        self.arg = sparse_arg
+        self.func = func
+        self.dtype = kwargs.pop("dtype", None)
+        self.kwargs = kwargs
+        self.cache = {}
+        self.shape = sparse_arg.shape
+
+        self._get_fill_value()
+
+    def get_result(self):
+        from ._coo import COO
+        from ._compressed import GCXS
+
+        data = self._get_func_data()
+
+        if isinstance(self.arg, GCXS):
+            return GCXS(
+                (data, self.arg.indices, self.arg.indptr),
+                shape=self.shape,
+                compressed_axes=self.arg.compressed_axes,
+                fill_value=self.fill_value,
+                prune=True,
+            )
+        else:
+            return COO(
+                self.arg.coords,
+                data,
+                shape=self.shape,
+                has_duplicates=False,
+                fill_value=self.fill_value,
+                prune=True,
+            ).asformat(self.out_type)
+
+    def _get_fill_value(self):
+        """
+        A function that finds and returns the fill-value.
+        """
+        zero_arg = self.arg.fill_value[...]
+
+        # Some elemwise functions require a dtype argument, some abhorr it.
+        try:
+            fill_value_array = self.func(zero_arg, dtype=self.dtype, **self.kwargs)
+        except TypeError:
+            fill_value_array = self.func(zero_arg, **self.kwargs)
+
+        try:
+            fill_value = fill_value_array[(0,) * fill_value_array.ndim]
+        except IndexError:
+            zero_arg = self.arg.fill_value
+            fill_value = self.func(zero_arg, **self.kwargs)[()]
+
+        # Store dtype separately if needed.
+        if self.dtype is not None:
+            fill_value = fill_value.astype(self.dtype)
+
+        self.fill_value = fill_value
+        self.dtype = self.fill_value.dtype
+
+    def _get_func_data(self):
+        """
+        Gets the data
+
+        Returns
+        -------
+        None or np.ndarray
+            The result of calling the function on the data
+        """
+
+        # Try our best to preserve the output dtype.
+        try:
+            func_data = self.func(self.arg.data, dtype=self.dtype, **self.kwargs)
+        except TypeError:
+            try:
+                out = np.empty(self.arg.data.shape, dtype=self.dtype)
+                func_data = self.func(self.arg.data, out=out, **self.kwargs)
+            except TypeError:
+                func_data = self.func(self.arg.data, **self.kwargs).astype(self.dtype)
+
+        return func_data
 
 
 def _rev_idx(arg, idx):
